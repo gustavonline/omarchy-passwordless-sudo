@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2
+
+- Show the real remaining duration for Omarchy's monotonic expiration timer
+  instead of falling back to one minute.
+
 ## 0.2.1
 
 - Fix command-window launch when Warp is the preferred desktop terminal by

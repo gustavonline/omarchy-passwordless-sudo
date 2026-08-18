@@ -11,12 +11,17 @@ jq -e '
 ' "$plugin_dir/manifest.json" >/dev/null
 
 bash -n "$plugin_dir/passwordless-sudo-control"
-"$plugin_dir/passwordless-sudo-control" status | jq -e '
+status_json=$("$plugin_dir/passwordless-sudo-control" status)
+jq -e '
   (.active | type == "boolean") and
   (.timerActive | type == "boolean") and
   (.remainingSeconds | type == "number") and
   (.label | type == "string")
-' >/dev/null
+' <<<"$status_json" >/dev/null
+
+if systemctl is-active --quiet "omarchy-nopasswd-expire-${USER}.timer"; then
+  jq -e '.remainingSeconds > 0 and (.expires | length > 0)' <<<"$status_json" >/dev/null
+fi
 
 test_root=$(mktemp -d)
 trap 'rm -rf -- "$test_root"' EXIT

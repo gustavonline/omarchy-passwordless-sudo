@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.gustavonline.passwordless-sudo",
   "name": "Passwordless Sudo",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "author": "Gustav Andersen",
   "license": "MIT",
   "description": "Open Omarchy's passwordless-sudo flow for a chosen duration from the bar.",
