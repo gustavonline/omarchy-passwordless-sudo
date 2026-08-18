@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+- Fix command-window launch when Warp is the preferred desktop terminal by
+  using Omarchy's bundled Foot terminal for this flow only.
+- Call Omarchy's native `omarchy-sudo-passwordless` command directly, matching
+  the stock Security menu action.
+
 ## 0.2.0
 
 - Replace the four shortcuts with 60- and 120-minute presets.

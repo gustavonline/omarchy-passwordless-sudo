@@ -14,6 +14,11 @@ command:
 omarchy sudo passwordless MINUTES
 ```
 
+If Warp is your preferred terminal, the confirmation window uses Omarchy's
+bundled Foot terminal for this flow only. Warp remains your desktop default;
+the fallback is needed because Warp's Linux launcher cannot run commands via
+`xdg-terminal-exec`.
+
 The plugin does not edit or inspect sudoers, create timers, cache passwords, or
 duplicate Omarchy's security implementation. Its background status check is
 unprivileged. Omarchy remains responsible for its warning, confirmation,
