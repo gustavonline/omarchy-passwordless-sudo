@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.gustavonline.passwordless-sudo",
+  "name": "Passwordless Sudo",
+  "version": "0.1.0",
+  "author": "Gustav Andersen",
+  "license": "MIT",
+  "description": "Open Omarchy's passwordless-sudo flow for a chosen duration from the bar.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Passwordless Sudo",
+    "description": "Launch Omarchy's native, time-limited passwordless-sudo command in its default floating terminal.",
+    "category": "System",
+    "aliases": ["sudo", "passwordless", "agent", "root"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "shortMinutes": 15,
+      "mediumMinutes": 30,
+      "longMinutes": 60,
+      "extendedMinutes": 120,
+      "refreshIntervalSec": 5
+    },
+    "schema": [
+      {
+        "key": "shortMinutes",
+        "type": "integer",
+        "label": "First interval (minutes)",
+        "min": 1,
+        "max": 1440,
+        "defaultValue": 15
+      },
+      {
+        "key": "mediumMinutes",
+        "type": "integer",
+        "label": "Second interval (minutes)",
+        "min": 1,
+        "max": 1440,
+        "defaultValue": 30
+      },
+      {
+        "key": "longMinutes",
+        "type": "integer",
+        "label": "Third interval (minutes)",
+        "min": 1,
+        "max": 1440,
+        "defaultValue": 60
+      },
+      {
+        "key": "extendedMinutes",
+        "type": "integer",
+        "label": "Fourth interval (minutes)",
+        "min": 1,
+        "max": 1440,
+        "defaultValue": 120
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Status refresh (seconds)",
+        "min": 2,
+        "max": 60,
+        "defaultValue": 5
+      }
+    ]
+  }
+}
