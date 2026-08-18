@@ -21,11 +21,9 @@ Panel {
   readonly property int refreshInterval: Math.max(2, Number(
     settings && settings.refreshIntervalSec ? settings.refreshIntervalSec : 5
   )) * 1000
-  readonly property var intervals: [
-    Number(settings && settings.shortMinutes ? settings.shortMinutes : 15),
-    Number(settings && settings.mediumMinutes ? settings.mediumMinutes : 30),
-    Number(settings && settings.longMinutes ? settings.longMinutes : 60),
-    Number(settings && settings.extendedMinutes ? settings.extendedMinutes : 120)
+  readonly property var presets: [
+    Number(settings && settings.primaryMinutes ? settings.primaryMinutes : 60),
+    Number(settings && settings.secondaryMinutes ? settings.secondaryMinutes : 120)
   ]
 
   property var status: ({ active: false, timerActive: false, remainingSeconds: 0, expires: "", label: "Password required" })
@@ -114,29 +112,21 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
+    text: root.status.active ? "󰌾" : "󰌿"
     tooltipText: root.status.active ? root.remainingLabel() : "Passwordless sudo"
-    iconComponent: Component {
-      Item {
-        Text {
-          anchors.centerIn: parent
-          text: root.status.active ? "󰌾" : "󰌿"
-          color: root.foreground
-          opacity: 1.0
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-        }
-        Rectangle {
-          visible: root.status.active
-          width: root.status.active ? Style.space(5) : Style.space(4)
-          height: width
-          radius: width / 2
-          anchors.right: parent.right
-          anchors.bottom: parent.bottom
-          anchors.rightMargin: Style.space(2)
-          anchors.bottomMargin: Style.space(2)
-          color: Color.urgent
-        }
-      }
+    active: root.status.active
+    useActiveColor: false
+
+    Rectangle {
+      visible: root.status.active
+      width: Style.space(5)
+      height: width
+      radius: width / 2
+      anchors.right: parent.right
+      anchors.bottom: parent.bottom
+      anchors.rightMargin: Style.space(2)
+      anchors.bottomMargin: Style.space(2)
+      color: Color.urgent
     }
     onPressed: function(buttonCode) { root.toggle() }
   }
@@ -154,6 +144,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      blocked: customDuration.field.activeFocus
       onActivateRequested: root.refresh()
       onCloseRequested: root.close()
 
@@ -214,7 +205,7 @@ Panel {
           readonly property real cellWidth: (width - spacing) / 2
 
           Repeater {
-            model: root.intervals
+            model: root.presets
 
             Button {
               required property var modelData
@@ -229,6 +220,32 @@ Panel {
               onClicked: root.runAction("launch", modelData)
             }
           }
+        }
+
+        NumberField {
+          id: customDuration
+          width: parent.width
+          fieldWidth: width
+          label: "Custom duration in minutes"
+          value: 180
+          from: 1
+          to: 1440
+          stepSize: 15
+          foreground: root.foreground
+          accent: root.accent
+          fontFamily: root.fontFamily
+        }
+
+        Button {
+          width: parent.width
+          text: "Open for " + customDuration.field.value + " min"
+          enabled: !root.busy && customDuration.field.value >= 1 && customDuration.field.value <= 1440
+          bordered: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.bodySmall
+          verticalPadding: Style.spacing.controlPaddingY
+          onClicked: root.runAction("launch", customDuration.field.value)
         }
 
         Button {

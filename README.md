@@ -3,9 +3,9 @@
 An Omarchy bar plugin that opens Omarchy's own temporary passwordless-sudo
 flow for a chosen duration.
 
-The panel offers 15, 30, 60, and 120 minute shortcuts by default, displays
-Omarchy's active expiration timer, and provides an early-disable action. The
-intervals can be changed through the plugin's Omarchy settings.
+The panel offers 60 and 120 minute presets, an editable custom duration from
+1 to 1440 minutes, Omarchy's active expiration timer, and an early-disable
+action. The two presets can be changed through the plugin's Omarchy settings.
 
 Every action opens the standard Omarchy floating terminal and runs the public
 command:
