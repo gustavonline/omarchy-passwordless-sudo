@@ -121,13 +121,13 @@ Panel {
           anchors.centerIn: parent
           text: root.status.active ? "󰌾" : "󰌿"
           color: root.foreground
-          opacity: root.status.active ? 1.0 : 0.6
+          opacity: 1.0
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
         }
         Rectangle {
           visible: root.status.active
-          width: Style.space(4)
+          width: root.status.active ? Style.space(5) : Style.space(4)
           height: width
           radius: width / 2
           anchors.right: parent.right
