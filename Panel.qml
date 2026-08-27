@@ -14,6 +14,7 @@ Panel {
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property color accent: Color.accent
+  readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property string controlPath: decodeURIComponent(
     String(Qt.resolvedUrl("passwordless-sudo-control")).replace(/^file:\/\//, "")
@@ -29,6 +30,8 @@ Panel {
   property var status: ({ active: false, timerActive: false, remainingSeconds: 0, expires: "", label: "Password required" })
   property bool busy: false
   property string feedback: ""
+  property bool feedbackIsError: false
+  property string pendingAction: ""
 
   visible: true
   implicitWidth: button.implicitWidth
@@ -46,17 +49,38 @@ Panel {
     if (!statusProcess.running) statusProcess.running = true
   }
 
+  function clearFeedback() {
+    feedbackClearTimer.stop()
+    feedback = ""
+    feedbackIsError = false
+  }
+
+  function showTransientFeedback(message) {
+    feedbackIsError = false
+    feedback = message
+    feedbackClearTimer.restart()
+  }
+
+  function showError(message) {
+    feedbackClearTimer.stop()
+    feedback = message
+    feedbackIsError = true
+  }
+
   function runAction(action, value) {
     if (actionProcess.running) return
     busy = true
+    pendingAction = action
+    feedbackClearTimer.stop()
     feedback = "Opening Omarchy terminal…"
+    feedbackIsError = false
     actionProcess.command = [controlPath, action]
     if (value !== undefined && value !== null && String(value) !== "") actionProcess.command.push(String(value))
     actionProcess.running = true
   }
 
   onOpenedChanged: if (opened) {
-    feedback = ""
+    clearFeedback()
     refresh()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -70,6 +94,16 @@ Panel {
     onTriggered: root.refresh()
   }
 
+  Timer {
+    id: feedbackClearTimer
+    interval: 3500
+    repeat: false
+    onTriggered: {
+      root.feedback = ""
+      root.feedbackIsError = false
+    }
+  }
+
   Process {
     id: statusProcess
     running: false
@@ -81,8 +115,15 @@ Panel {
           var parsed = JSON.parse(String(text || ""))
           if (parsed && typeof parsed === "object") root.status = parsed
         } catch (e) {
-          root.feedback = "Could not read sudo status"
+          root.showError("Could not read sudo status")
         }
+      }
+    }
+    stderr: StdioCollector { id: statusError; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        var details = String(statusError.text || "Could not read sudo status").trim()
+        root.showError(details.length > 180 ? details.slice(0, 177) + "…" : details)
       }
     }
   }
@@ -90,9 +131,17 @@ Panel {
   Process {
     id: actionProcess
     running: false
+    stdout: StdioCollector { id: actionOutput; waitForEnd: true }
+    stderr: StdioCollector { id: actionError; waitForEnd: true }
     onExited: function(exitCode) {
       root.busy = false
-      root.feedback = exitCode === 0 ? "" : "Could not open Omarchy terminal"
+      if (exitCode === 0) {
+        root.showTransientFeedback(root.pendingAction === "disable" ? "Disable flow opened" : "Omarchy terminal opened")
+      } else {
+        var details = String(actionError.text || actionOutput.text || "Could not open Omarchy terminal").trim()
+        root.showError(details.length > 180 ? details.slice(0, 177) + "…" : details)
+      }
+      root.pendingAction = ""
       root.refresh()
     }
   }
@@ -265,7 +314,7 @@ Panel {
           visible: root.feedback !== ""
           width: parent.width
           text: root.feedback
-          color: root.dim
+          color: root.feedbackIsError ? root.urgent : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           horizontalAlignment: Text.AlignHCenter

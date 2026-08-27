@@ -6,11 +6,15 @@ plugin_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 jq -e '
   .schemaVersion == 1 and
   .id == "io.github.gustavonline.passwordless-sudo" and
+  .version == "0.3.0" and
   (.kinds | index("bar-widget")) != null and
   .entryPoints.barWidget == "Panel.qml"
 ' "$plugin_dir/manifest.json" >/dev/null
 
 bash -n "$plugin_dir/passwordless-sudo-control"
+grep -qE 'id: feedbackClearTimer' "$plugin_dir/Panel.qml"
+grep -qE 'function showTransientFeedback\(message\)' "$plugin_dir/Panel.qml"
+grep -qE 'function showError\(message\)' "$plugin_dir/Panel.qml"
 status_json=$("$plugin_dir/passwordless-sudo-control" status)
 jq -e '
   (.active | type == "boolean") and

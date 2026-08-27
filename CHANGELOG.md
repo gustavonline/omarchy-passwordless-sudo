@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 — 2026-08-27
+
+- Show concrete runtime errors and keep them visible until the next action
+- Clear successful action feedback automatically after a short delay
+- Add public installation, update, removal, CI, and release documentation
+- Harden systemd unit argument handling and add portable release checks
+
 ## 0.2.2
 
 - Show the real remaining duration for Omarchy's monotonic expiration timer
