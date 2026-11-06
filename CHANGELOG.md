@@ -1,4 +1,13 @@
-# Changelog
+## 0.5.0
+
+- Rename the widget to Omarchy Agent Access; keep the existing plugin ID.
+- Add QR enrollment and phone-approved windows for multiple agent commands.
+- Add a centre-bar quick action with a configurable default duration.
+- Use Omarchy panel styling and a live countdown; support early close and shortening.
+- Ship an agent skill, automatic user-level registration and a health check.
+- Preserve enrollment during upgrades and roll back interrupted installations.
+- Keep status responsive while a terminal waits for a phone code.
+- Test fresh installation, enrollment, upgrades, rollback and access controls in a disposable container.
 
 ## 0.3.0 — 2026-08-27
 

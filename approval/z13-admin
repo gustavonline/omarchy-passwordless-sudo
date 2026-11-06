@@ -1,0 +1,377 @@
+#!/usr/bin/python3 -I
+"""Phone-approved root access window. Install root-owned; never setuid.
+
+Admission expires after at most 15 minutes; completed root changes are not undone.
+Uses RFC 6238 TOTP with HMAC-SHA1, 6 digits and 30-second periods.
+"""
+import argparse
+import base64
+import contextlib
+import fcntl
+import getpass
+import hmac
+import json
+import math
+import os
+import pwd
+from pathlib import Path
+import re
+import secrets
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import syslog
+import tempfile
+import time
+import urllib.parse
+
+OWNER = None
+OWNER_CONFIG = Path('/etc/omarchy-sudo-approval-owner')
+PRIVATE = Path('/var/lib/z13-admin')
+RUNTIME = Path('/run/z13-admin')
+MAX_MINUTES = 15
+REQUEST_TTL = 300
+VERSION = '2.0.1'
+
+
+def boottime():
+    # Includes suspend time, unlike CLOCK_MONOTONIC.
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def boot_id():
+    return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+
+
+def configured_owner():
+    info = OWNER_CONFIG.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError('Unsafe owner configuration')
+    name = OWNER_CONFIG.read_text().strip()
+    if not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', name) or pwd.getpwnam(name).pw_uid == 0:
+        raise ValueError('Invalid configured owner')
+    return name
+
+
+def totp(secret, counter, digits=6):
+    key = base64.b32decode(secret, casefold=False)
+    digest = hmac.digest(key, struct.pack('>Q', counter), 'sha1')
+    offset = digest[-1] & 15
+    value = struct.unpack('>I', digest[offset:offset + 4])[0] & 0x7fffffff
+    return str(value % (10 ** digits)).zfill(digits)
+
+
+def matching_counter(secret, code, now, last):
+    if not re.fullmatch(r'[0-9]{6}', code):
+        return None
+    current = int(now // 30)
+    for counter in (current, current - 1, current + 1):
+        if counter > last and hmac.compare_digest(totp(secret, counter), code):
+            return counter
+    return None
+
+
+def live(record, now, boot):
+    return (isinstance(record, dict) and record.get('boot') == boot
+            and type(record.get('expires')) in (int, float)
+            and math.isfinite(record['expires']) and now < record['expires'])
+
+
+def atomic_json(path, value):
+    fd, name = tempfile.mkstemp(prefix='.write-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(value, stream)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+
+
+def private_directory(path):
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077:
+        raise ValueError(f'Unsafe root state directory: {path}')
+
+
+@contextlib.contextmanager
+def locked():
+    private_directory(PRIVATE)
+    private_directory(RUNTIME)
+    with (PRIVATE / 'lock').open('a') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+def audit(event, request_id=''):
+    # Never log OTP, secret, command arguments or user-supplied reason.
+    syslog.openlog('z13-admin')
+    syslog.syslog(syslog.LOG_AUTHPRIV | syslog.LOG_NOTICE,
+                  f'{event} owner={OWNER} request={request_id}')
+
+
+def phone_code(prompt, seconds=60):
+    def expired(_signal, _frame):
+        raise ValueError('Phone-code entry timed out; no approval was granted')
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.alarm(max(1, seconds))
+    try:
+        return getpass.getpass(prompt)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def validate_argv(argv):
+    if argv and argv[0] == '--':
+        argv = argv[1:]
+    if not argv or len(argv) > 128 or sum(map(len, argv)) > 16384:
+        raise ValueError('Supply one absolute executable and bounded arguments after --')
+    if any(any(not c.isprintable() for c in arg) for arg in argv):
+        raise ValueError('Control characters are not allowed')
+    executable = Path(argv[0])
+    if not executable.is_absolute():
+        raise ValueError('Executable must be absolute')
+    executable = executable.resolve(strict=True)
+    # Reject direct execution of user-controlled binaries and writable parents.
+    for path in (executable, *executable.parents):
+        info = path.stat()
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError('Executable and its parents must be root-owned, not group/world writable')
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise ValueError('Executable is not executable')
+    return [str(executable), *argv[1:]]
+
+
+def request(args):
+    argv = validate_argv(args.argv) if args.argv else None
+    if not 1 <= args.minutes <= MAX_MINUTES:
+        raise ValueError(f'Duration must be 1–{MAX_MINUTES} minutes')
+    if not 1 <= len(args.reason) <= 400 or not args.reason.isprintable():
+        raise ValueError('Reason must be 1–400 printable characters')
+    with locked():
+        if not (PRIVATE / 'auth.json').exists():
+            raise ValueError('Owner enrollment is required first')
+        old = read_json(RUNTIME / 'request.json')
+        if live(old, boottime(), boot_id()) and old.get('state') in ('pending', 'approved'):
+            raise ValueError('A live request already exists; revoke it first')
+        value = {'id': secrets.token_hex(8), 'argv': argv, 'reason': args.reason,
+                 'mode': 'command' if argv else 'window', 'runs': 0,
+                 'minutes': args.minutes, 'boot': boot_id(),
+                 'expires': boottime() + REQUEST_TTL, 'state': 'pending'}
+        atomic_json(RUNTIME / 'request.json', value)
+        audit('requested', value['id'])
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def approve(args):
+    # Hide entry even when the agent passes a human-supplied code over a PTY.
+    # Never accept secrets as argv or from environment variables.
+    with locked():
+        value = read_json(RUNTIME / 'request.json')
+        if not live(value, boottime(), boot_id()) or value['state'] != 'pending' or value['id'] != args.id:
+            raise ValueError('No matching live pending request')
+        mode = value.get('mode', 'command')
+        if mode not in ('command', 'window'):
+            raise ValueError('Unknown approval mode')
+        minutes = getattr(args, 'minutes', None)
+        if minutes is not None:
+            if not 1 <= minutes <= value['minutes']:
+                raise ValueError('Approval may shorten, never increase the requested duration')
+            value['minutes'] = minutes
+        if mode == 'command':
+            print('One root command (JSON argv):', json.dumps(value['argv'], ensure_ascii=True), flush=True)
+        else:
+            print('ROOT ACCESS WINDOW: multiple commands through z13-admin run.', flush=True)
+        print('Reason:', json.dumps(value['reason'], ensure_ascii=True), flush=True)
+        print(f"Access duration: {value['minutes']} minutes from approval; no automatic renewal.", flush=True)
+        print('Root commands can make lasting changes. Review every argument.', flush=True)
+        auth = read_json(PRIVATE / 'auth.json')
+        if auth.get('rate_boot') != boot_id():
+            # Failed-attempt lockout survives reboot by starting a fresh cooldown.
+            auth['rate_boot'] = boot_id()
+            auth['blocked_until'] = boottime() + (300 if auth.get('failures', 0) >= 5 else 0)
+            atomic_json(PRIVATE / 'auth.json', auth)
+        if auth.get('blocked_until', 0) > boottime():
+            raise ValueError('Too many failed attempts; wait five minutes')
+        if not sys.stdin.isatty():
+            raise ValueError('Approval requires a terminal for hidden OTP entry')
+        code = phone_code('Phone code: ', min(60, max(1, math.ceil(value['expires'] - boottime()))))
+        # Time spent reading is part of the request TTL.
+        if not live(value, boottime(), boot_id()):
+            raise ValueError('Request expired while waiting for approval')
+        counter = matching_counter(auth['secret'], code, time.time(), auth['last_counter'])
+        if counter is None:
+            auth['failures'] = auth.get('failures', 0) + 1
+            if auth['failures'] >= 5:
+                auth['blocked_until'] = boottime() + 300
+            atomic_json(PRIVATE / 'auth.json', auth)
+            audit('approval-denied', value['id'])
+            raise ValueError('Invalid or already used phone code')
+        # Persist replay protection BEFORE enabling execution; failure consumes OTP safely.
+        auth.update(last_counter=counter, failures=0, blocked_until=0)
+        atomic_json(PRIVATE / 'auth.json', auth)
+        value.update(state='approved', expires=boottime() + value['minutes'] * 60)
+        atomic_json(RUNTIME / 'request.json', value)
+        audit('approved', value['id'])
+    print('Approved:', value['id'])
+
+
+def consume(value, request_id, now, boot):
+    if not live(value, now, boot) or value.get('state') != 'approved' or value.get('id') != request_id:
+        raise ValueError('No matching live approval')
+    return {**value, 'state': 'consumed'}
+
+
+def run_request(args):
+    with locked():
+        value = read_json(RUNTIME / 'request.json')
+        if not live(value, boottime(), boot_id()) or value.get('state') != 'approved' or value.get('id') != args.id:
+            raise ValueError('No matching live approval')
+        mode = value.get('mode', 'command')
+        supplied = getattr(args, 'argv', [])
+        if mode == 'command':
+            if supplied:
+                raise ValueError('Command-bound approval cannot change its command')
+            value = consume(value, args.id, boottime(), boot_id())
+            argv = validate_argv(value['argv'])
+            if argv != value['argv']:
+                raise ValueError('Executable path changed; request fresh approval')
+        elif mode == 'window':
+            argv = validate_argv(supplied)
+        else:
+            raise ValueError('Unknown approval mode')
+        value['runs'] = value.get('runs', 0) + 1
+        atomic_json(RUNTIME / 'request.json', value)
+        audit('command-consumed' if mode == 'command' else 'window-command-started', value['id'])
+    # Execution never inherits owner PATH, Python imports, startup hooks or HOME.
+    environment = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root',
+                   'USER': 'root', 'LOGNAME': 'root', 'LANG': 'C.UTF-8', 'TERM': 'dumb'}
+    os.chdir('/root')
+    os.execve(argv[0], argv, environment)
+
+
+def status(_args):
+    # Writers replace complete JSON files atomically. Status must remain available
+    # while another terminal is waiting for the owner's code under the write lock.
+    private_directory(PRIVATE)
+    private_directory(RUNTIME)
+    value = read_json(RUNTIME / 'request.json')
+    enrolled = (PRIVATE / 'auth.json').exists()
+    if value:
+        value['live'] = live(value, boottime(), boot_id()) and value['state'] in ('pending', 'approved')
+        value['seconds_left'] = max(0, int(value['expires'] - boottime())) if value['live'] else 0
+    print(json.dumps({'version': VERSION, 'enrolled': enrolled, 'request': value}, ensure_ascii=False, indent=2))
+
+
+def shorten(args):
+    if not 1 <= args.minutes <= MAX_MINUTES:
+        raise ValueError(f'Duration must be 1–{MAX_MINUTES} minutes')
+    with locked():
+        value = read_json(RUNTIME / 'request.json')
+        if not live(value, boottime(), boot_id()) or value.get('id') != args.id or value.get('state') not in ('pending', 'approved'):
+            raise ValueError('No matching live request/window')
+        if args.minutes > value['minutes']:
+            raise ValueError('Cannot extend access; request a new phone approval')
+        value['minutes'] = args.minutes
+        if value['state'] == 'approved':
+            value['expires'] = min(value['expires'], boottime() + args.minutes * 60)
+        atomic_json(RUNTIME / 'request.json', value)
+        audit('shortened', value['id'])
+    print('Duration reduced or unchanged; existing expiry can never move later.')
+
+
+def revoke(_args):
+    with locked():
+        value = read_json(RUNTIME / 'request.json')
+        if value:
+            value['state'] = 'revoked'
+            atomic_json(RUNTIME / 'request.json', value)
+            audit('revoked', value['id'])
+    print('Closed request/access window. An already running command is unaffected.')
+
+
+def enroll(_args):
+    # Separate executable is password protected in sudoers; direct root is recovery.
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError('Enroll on the owner terminal, without agent transcript capture')
+    with locked():
+        if (PRIVATE / 'auth.json').exists():
+            raise ValueError('Already enrolled; use root recovery to remove auth.json before re-enrolling')
+        secret = base64.b32encode(secrets.token_bytes(20)).decode()
+        uri = 'otpauth://totp/' + urllib.parse.quote('Omarchy sudo:' + OWNER) + '?' + urllib.parse.urlencode(
+            {'secret': secret, 'issuer': 'Omarchy sudo', 'algorithm': 'SHA1', 'digits': '6', 'period': '30'})
+        print('Scan locally in your authenticator. Do not share or save the QR in chat.', flush=True)
+        subprocess.run(['/usr/bin/qrencode', '-t', 'ANSIUTF8'], input=uri, text=True, check=True,
+                       env={'PATH': '/usr/bin', 'LANG': 'C.UTF-8'})
+        code = phone_code('Confirm phone code: ')
+        counter = matching_counter(secret, code, time.time(), -1)
+        if counter is None:
+            raise ValueError('Confirmation failed; no secret was saved')
+        atomic_json(PRIVATE / 'auth.json', {'secret': secret, 'last_counter': counter,
+                    'failures': 0, 'blocked_until': 0, 'rate_boot': boot_id()})
+        audit('enrolled')
+    print('Enrolled. Wait for the next phone code before first approval.')
+
+
+def main():
+    global OWNER
+    os.umask(0o077)
+    if os.geteuid() != 0:
+        raise ValueError('Run through the installed sudo entry as the configured owner')
+    OWNER = configured_owner()
+    if os.environ.get('SUDO_USER', 'root') not in (OWNER, 'root'):
+        raise ValueError('Run through the installed sudo entry as gustav')
+    parser = argparse.ArgumentParser(description=__doc__)
+    subs = parser.add_subparsers(dest='action', required=True)
+    req = subs.add_parser('request')
+    req.add_argument('--minutes', type=int, default=5)
+    req.add_argument('--reason', required=True)
+    req.add_argument('argv', nargs=argparse.REMAINDER)
+    approval = subs.add_parser('approve')
+    approval.add_argument('id')
+    approval.add_argument('--minutes', type=int)
+    execution = subs.add_parser('run')
+    execution.add_argument('id')
+    execution.add_argument('argv', nargs=argparse.REMAINDER)
+    shorter = subs.add_parser('shorten')
+    shorter.add_argument('id')
+    shorter.add_argument('--minutes', type=int, required=True)
+    for action in ('status', 'revoke', 'enroll'):
+        subs.add_parser(action)
+    args = parser.parse_args()
+    # Resolve symlinks: sudo may canonicalize a user-created command alias.
+    # A renamed symlink to the passwordless broker must never enable enrollment.
+    enrollment_entry = Path(sys.argv[0]).resolve() == Path('/usr/local/sbin/z13-admin-enroll')
+    if (args.action == 'enroll') != enrollment_entry:
+        raise ValueError('Use the separate password-protected z13-admin-enroll executable for enrollment')
+    globals()[{'run': 'run_request'}.get(args.action, args.action)](args)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        print(f'z13-admin: {error}', file=sys.stderr)
+        sys.exit(1)

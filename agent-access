@@ -1,0 +1,190 @@
+#!/usr/bin/python3 -I
+"""Owner UI/agent adapter. Never accepts OTP as argv, environment or UI state."""
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+
+HERE = Path(__file__).resolve().parent
+BROKER = '/usr/local/sbin/z13-admin'
+
+
+def execute(argv, timeout=8):
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    if result.returncode:
+        raise ValueError((result.stderr or result.stdout).strip() or f'Command failed ({result.returncode})')
+    return result.stdout.strip()
+
+
+def broker(*args):
+    return execute(['/usr/bin/sudo', '-n', BROKER, *args], timeout=3)
+
+
+def broker_status():
+    return json.loads(broker('status'))
+
+
+def window_status(data):
+    request = data.get('request') or {}
+    ready = str(data.get('version', '')).startswith('2.')
+    active = ready and request.get('mode') == 'window' and request.get('live') is True and request.get('state') == 'approved'
+    pending = ready and request.get('live') is True and request.get('state') == 'pending'
+    remaining = request.get('seconds_left', 0) if active else 0
+    return {'ready': ready, 'enrolled': bool(data.get('enrolled')), 'active': active,
+            'pending': pending, 'requestId': request.get('id', ''), 'reason': request.get('reason', ''),
+            'requestedMinutes': request.get('minutes', 5), 'remainingSeconds': remaining,
+            'totalSeconds': request.get('minutes', 5) * 60,
+            'expires': (datetime.datetime.now().astimezone() + datetime.timedelta(seconds=remaining)).isoformat() if active else '',
+            'timerActive': active, 'kind': 'phone', 'label': 'Phone-approved access' if active else 'Phone approval required'}
+
+
+def status():
+    try:
+        value = window_status(broker_status())
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        value = window_status({})
+        value['setupError'] = str(error)
+    legacy = json.loads(execute([str(HERE / 'native-sudo-control'), 'status']))
+    value['nativeActive'] = legacy.get('active', False)
+    value['nativeRemainingSeconds'] = legacy.get('remainingSeconds', 0)
+    value['rootUpgradeNeeded'] = root_upgrade_needed()
+    print(json.dumps(value))
+
+
+def root_upgrade_needed():
+    try:
+        return hashlib.sha256(Path(BROKER).read_bytes()).digest() != hashlib.sha256((HERE / 'approval/z13-admin').read_bytes()).digest()
+    except OSError:
+        return True
+
+
+def skill_links(home=None):
+    home = Path.home() if home is None else Path(home)
+    return [home / base / 'omarchy-agent-access' for base in ('.agents/skills', '.claude/skills', '.codex/skills')]
+
+
+def install_skill(home=None):
+    for link in skill_links(home):
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink() and link.resolve() == HERE:
+            continue
+        if link.exists() or link.is_symlink():
+            raise ValueError(f'An unrelated skill already occupies {link}')
+        link.symlink_to(HERE, target_is_directory=True)
+    home = Path.home() if home is None else Path(home)
+    entry = home / '.local/bin/omarchy-agent-access'
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    if entry.is_symlink() and entry.resolve() == HERE / 'agent-access':
+        return
+    if entry.exists() or entry.is_symlink():
+        raise ValueError(f'An unrelated command already occupies {entry}')
+    entry.symlink_to(HERE / 'agent-access')
+
+
+def doctor():
+    checks = {}
+    for executable in ('sudo', 'python3', 'foot', 'jq', 'qrencode', 'omarchy'):
+        checks[executable] = shutil.which(executable) is not None
+    try:
+        execute(['omarchy', 'plugin', 'validate', str(HERE)])
+        checks['manifest'] = True
+    except (ValueError, OSError, subprocess.SubprocessError):
+        checks['manifest'] = False
+    try:
+        checks['broker'] = window_status(broker_status())['ready']
+    except (ValueError, OSError, subprocess.SubprocessError):
+        checks['broker'] = False
+    checks['rootCurrent'] = not root_upgrade_needed()
+    checks['skill'] = all(link.is_symlink() and link.resolve() == HERE for link in skill_links())
+    result = {'ok': all(checks.values()), 'checks': checks}
+    print(json.dumps(result, indent=2))
+    return 0 if result['ok'] else 1
+
+
+def minutes(value):
+    if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= 15:
+        raise ValueError('Phone-approved duration must be 1–15 minutes')
+    return str(int(value))
+
+
+def terminal(argv):
+    # Secrets are read by getpass inside the terminal, never by this adapter.
+    environment = os.environ.copy()
+    runtime = Path(environment.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}'))
+    if not environment.get('WAYLAND_DISPLAY'):
+        sockets = [p for p in runtime.glob('wayland-[0-9]*') if p.is_socket()]
+        if len(sockets) != 1:
+            raise ValueError('No unambiguous Wayland desktop. Use the owner’s own SSH terminal for headless setup/enrollment.')
+        environment['WAYLAND_DISPLAY'] = sockets[0].name
+        environment['XDG_RUNTIME_DIR'] = str(runtime)
+    subprocess.Popen(['/usr/bin/flock', '-n', str(runtime / 'omarchy-agent-access-terminal.lock'),
+                      '/usr/bin/foot', '--app-id=org.omarchy.terminal', '--title=Omarchy Agent Access', *argv], env=environment,
+                     start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else 'status'
+    if action == 'status':
+        status()
+    elif action in ('help', '--help', '-h'):
+        print('Omarchy Agent Access\nCommands: status, request MINUTES [REASON], approve, run ID -- /absolute/command [args], shorten MINUTES, close, setup, install-skill, doctor\nRead SKILL.md for agent setup and remote approval.')
+    elif action == 'install-skill':
+        install_skill()
+    elif action == 'doctor':
+        return doctor()
+    elif action == 'request':
+        duration = minutes(sys.argv[2])
+        reason = sys.argv[3] if len(sys.argv) > 3 else 'Omarchy owner access window'
+        print(broker('request', '--minutes', duration, '--reason', reason))
+    elif action == 'quick':
+        duration = minutes(sys.argv[2] if len(sys.argv) > 2 else '5')
+        data = broker_status()
+        if not data.get('enrolled'):
+            raise ValueError('Set up your phone first')
+        request = data.get('request') or {}
+        if request.get('live') and request.get('state') == 'approved':
+            raise ValueError('Access is already open')
+        if not request.get('live') or request.get('state') != 'pending':
+            request = json.loads(broker('request', '--minutes', duration, '--reason', 'Local maintenance'))
+        terminal(['/usr/bin/sudo', '-n', BROKER, 'approve', request['id']])
+    elif action == 'approve':
+        data = broker_status()
+        request = data.get('request') or {}
+        if not request.get('live') or request.get('state') != 'pending':
+            raise ValueError('No pending request to approve')
+        terminal(['/usr/bin/sudo', '-n', BROKER, 'approve', request['id']])
+    elif action == 'run':
+        if len(sys.argv) < 5:
+            raise ValueError('Use run REQUEST_ID -- /absolute/command [args]')
+        os.execv('/usr/bin/sudo', ['/usr/bin/sudo', '-n', BROKER, 'run', *sys.argv[2:]])
+    elif action in ('close', 'revoke'):
+        print(broker('revoke'))
+    elif action == 'shorten':
+        request = broker_status().get('request') or {}
+        print(broker('shorten', request.get('id', ''), '--minutes', minutes(sys.argv[2])))
+    elif action == 'setup':
+        install_skill()
+        script = shlex.quote(str(HERE / 'install-approval.sh'))
+        command = f'/usr/bin/sudo /usr/bin/bash {script} && {{ if /usr/bin/sudo -n {BROKER} status | /usr/bin/jq -e .enrolled >/dev/null; then printf "Phone already enrolled. Ready.\\n"; else /usr/bin/sudo /usr/local/sbin/z13-admin-enroll enroll; fi; }}; result=$?; printf "\\nExit: %s. Press Enter to close.\\n" "$result"; read -r answer; exit "$result"'
+        terminal(['/usr/bin/bash', '-c', command])
+    elif action in ('native-launch', 'launch', 'native-disable', 'disable'):
+        native_action = 'launch' if action in ('native-launch', 'launch') else 'disable'
+        args = [str(HERE / 'native-sudo-control'), native_action, *sys.argv[2:]]
+        subprocess.Popen(args, start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        raise ValueError('Use status, request MINUTES [REASON], approve, close, shorten MINUTES, setup or native-launch MINUTES')
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main() or 0)
+    except (ValueError, OSError, IndexError, subprocess.SubprocessError) as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)

@@ -1,10 +1,9 @@
-# Release checklist
+# Release checks
 
-1. Update `manifest.json` and `CHANGELOG.md` to the same semantic version.
-2. Run `./test.sh` on a current Omarchy installation.
-3. Install from a fresh clone and verify status, both presets, a custom duration,
-   error feedback, and the early-disable flow.
-4. Confirm the repository contains no sudoers files, credentials, local
-   configuration, or machine-specific paths.
-5. Push `main`, tag the manifest version, and create a GitHub Release from the
-   matching changelog section.
+- Run ./test.sh and validate the manifest with the installed Omarchy CLI.
+- Run tests/ui-smoke.sh in an Omarchy graphical session.
+- Run the clean-install container test, including enrollment, upgrade preservation and rollback.
+- Verify local quick access, remote approval, multiple commands, expiry and early close.
+- Check that no enrollment data, codes, machine settings or private network details enter the commit.
+- Update the changelog and manifest together. Preserve the plugin ID and existing enrollment paths.
+- Publish from the verified commit; check CI before tagging a release.

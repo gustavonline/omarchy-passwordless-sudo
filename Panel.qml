@@ -1,323 +1,327 @@
 import QtQuick
-import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 Panel {
   id: root
   moduleName: "io.github.gustavonline.passwordless-sudo"
-  ipcTarget: "io.github.gustavonline.passwordless-sudo"
+  ipcTarget: moduleName
   manageIpc: false
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color dim: Qt.darker(foreground, 1.55)
-  readonly property color accent: Color.accent
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
+  readonly property color muted: Qt.alpha(foreground, 0.58)
+  readonly property color accent: Commons.Color.accent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property string controlPath: decodeURIComponent(
-    String(Qt.resolvedUrl("passwordless-sudo-control")).replace(/^file:\/\//, "")
-  )
-  readonly property int refreshInterval: Math.max(2, Number(
-    settings && settings.refreshIntervalSec ? settings.refreshIntervalSec : 5
-  )) * 1000
-  readonly property var presets: [
-    Number(settings && settings.primaryMinutes ? settings.primaryMinutes : 60),
-    Number(settings && settings.secondaryMinutes ? settings.secondaryMinutes : 120)
-  ]
-
-  property var status: ({ active: false, timerActive: false, remainingSeconds: 0, expires: "", label: "Password required" })
+  readonly property string controlPath: decodeURIComponent(String(Qt.resolvedUrl("agent-access")).replace(/^file:\/\//, ""))
+  readonly property bool animate: !settings || settings.animations !== false
+  readonly property int defaultMinutes: settings && Number(settings.defaultMinutes) >= 1 && Number(settings.defaultMinutes) <= 15 ? Number(settings.defaultMinutes) : 5
+  readonly property bool accessOpen: status.active === true && remaining > 0
+  readonly property bool pending: status.pending === true
+  readonly property bool configured: status.ready === true && status.enrolled === true
+  property var status: ({ready: false, enrolled: false, active: false, pending: false, nativeActive: false})
+  property int selectedMinutes: 5
+  property int remaining: 0
+  property double deadline: 0
   property bool busy: false
+  property bool customDuration: false
+  property bool shortening: false
   property string feedback: ""
-  property bool feedbackIsError: false
-  property string pendingAction: ""
+  property bool feedbackError: false
+  property string action: ""
+  property real progress: accessOpen ? Math.min(1, remaining / Math.max(1, Number(status.totalSeconds || 300))) : 0
+  Behavior on progress { NumberAnimation { duration: root.animate ? 350 : 0; easing.type: Easing.OutCubic } }
 
-  visible: true
-  implicitWidth: button.implicitWidth
-  implicitHeight: button.implicitHeight
+  implicitWidth: barButton.implicitWidth
+  implicitHeight: barButton.implicitHeight
 
-  function remainingLabel() {
-    var seconds = Math.max(0, Number(status.remainingSeconds || 0))
-    if (!status.active) return "Sudo requires your password"
-    if (!status.timerActive) return "Active · expiration timer unavailable"
-    var minutes = Math.max(1, Math.ceil(seconds / 60))
-    return "Active · about " + minutes + " min remaining"
+  function clock(seconds) {
+    return String(Math.floor(seconds / 60)).padStart(2, "0") + ":" + String(seconds % 60).padStart(2, "0")
   }
-
-  function refresh() {
-    if (!statusProcess.running) statusProcess.running = true
-  }
-
-  function clearFeedback() {
-    feedbackClearTimer.stop()
-    feedback = ""
-    feedbackIsError = false
-  }
-
-  function showTransientFeedback(message) {
-    feedbackIsError = false
-    feedback = message
-    feedbackClearTimer.restart()
-  }
-
-  function showError(message) {
-    feedbackClearTimer.stop()
-    feedback = message
-    feedbackIsError = true
-  }
-
-  function runAction(action, value) {
+  function refresh() { if (!statusProcess.running) statusProcess.running = true }
+  function run(actionName, value) {
     if (actionProcess.running) return
+    action = actionName
+    feedback = ""
     busy = true
-    pendingAction = action
-    feedbackClearTimer.stop()
-    feedback = "Opening Omarchy terminal…"
-    feedbackIsError = false
-    actionProcess.command = [controlPath, action]
-    if (value !== undefined && value !== null && String(value) !== "") actionProcess.command.push(String(value))
+    actionProcess.command = [controlPath, actionName]
+    if (value !== undefined && String(value) !== "") actionProcess.command.push(String(value))
     actionProcess.running = true
   }
+  function requestAccess() { run("request", selectedMinutes) }
 
+  Component.onCompleted: {
+    selectedMinutes = defaultMinutes
+    skillProcess.running = true
+    refresh()
+  }
   onOpenedChanged: if (opened) {
-    clearFeedback()
     refresh()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
-
-  Component.onCompleted: refresh()
-
   Timer {
-    interval: root.refreshInterval
-    running: true
+    interval: 1000
+    running: root.status.active === true
     repeat: true
-    onTriggered: root.refresh()
-  }
-
-  Timer {
-    id: feedbackClearTimer
-    interval: 3500
-    repeat: false
     onTriggered: {
-      root.feedback = ""
-      root.feedbackIsError = false
+      root.remaining = Math.max(0, Math.ceil((root.deadline - Date.now()) / 1000))
+      if (root.remaining === 0) root.refresh()
     }
   }
-
+  Timer { interval: 5000; running: true; repeat: true; onTriggered: root.refresh() }
+  Process {
+    id: skillProcess
+    command: [root.controlPath, "install-skill"]
+    stderr: StdioCollector { id: skillError; waitForEnd: true }
+    onExited: function(code) {
+      if (code !== 0) { root.feedback = String(skillError.text).trim(); root.feedbackError = true }
+    }
+  }
   Process {
     id: statusProcess
-    running: false
     command: [root.controlPath, "status"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         try {
-          var parsed = JSON.parse(String(text || ""))
-          if (parsed && typeof parsed === "object") root.status = parsed
-        } catch (e) {
-          root.showError("Could not read sudo status")
-        }
+          const value = JSON.parse(text)
+          root.status = value
+          root.deadline = Date.now() + Number(value.remainingSeconds || 0) * 1000
+          root.remaining = Number(value.remainingSeconds || 0)
+        } catch (e) { root.feedback = "Could not read access status"; root.feedbackError = true }
       }
     }
     stderr: StdioCollector { id: statusError; waitForEnd: true }
-    onExited: function(exitCode) {
-      if (exitCode !== 0) {
-        var details = String(statusError.text || "Could not read sudo status").trim()
-        root.showError(details.length > 180 ? details.slice(0, 177) + "…" : details)
-      }
+    onExited: function(code) {
+      if (code !== 0) { root.feedback = String(statusError.text).trim(); root.feedbackError = true }
     }
   }
-
   Process {
     id: actionProcess
-    running: false
     stdout: StdioCollector { id: actionOutput; waitForEnd: true }
     stderr: StdioCollector { id: actionError; waitForEnd: true }
-    onExited: function(exitCode) {
+    onExited: function(code) {
       root.busy = false
-      if (exitCode === 0) {
-        root.showTransientFeedback(root.pendingAction === "disable" ? "Disable flow opened" : "Omarchy terminal opened")
-      } else {
-        var details = String(actionError.text || actionOutput.text || "Could not open Omarchy terminal").trim()
-        root.showError(details.length > 180 ? details.slice(0, 177) + "…" : details)
-      }
-      root.pendingAction = ""
+      root.feedbackError = code !== 0
+      root.feedback = code !== 0 ? String(actionError.text || actionOutput.text).trim()
+        : root.action === "approve" ? "Enter the phone code in the terminal."
+        : root.action === "setup" ? "Continue setup in the terminal." : ""
       root.refresh()
     }
   }
-
   IpcHandler {
     target: root.ipcTarget
     function open(): void { root.open() }
     function close(): void { root.close() }
-    function show(): void { root.open() }
-    function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): string { root.refresh(); return "ok" }
-    function status(): string { return root.status.active ? "active" : "inactive" }
+    function status(): string { return root.accessOpen ? "open" : root.pending ? "pending" : "locked" }
   }
 
   BarIconButton {
-    id: button
+    id: barButton
     anchors.fill: parent
     bar: root.bar
-    text: root.status.active ? "󰌾" : "󰌿"
-    tooltipText: root.status.active ? root.remainingLabel() : "Passwordless sudo"
-    active: root.status.active
-    useActiveColor: false
-
+    text: root.accessOpen ? "󰌾 " + root.clock(root.remaining) : "󰌿"
+    tooltipText: root.accessOpen ? "Agent access · " + root.clock(root.remaining) + " left" : root.pending ? "Agent access · awaiting approval" : "Omarchy Agent Access"
+    active: root.accessOpen || root.pending
+    onPressed: function(buttonCode) {
+      if (buttonCode === Qt.RightButton || root.accessOpen) root.toggle()
+      else if (!root.configured) root.run("setup", "")
+      else root.run("quick", root.defaultMinutes)
+    }
     Rectangle {
-      visible: root.status.active
-      width: Style.space(5)
-      height: width
-      radius: width / 2
       anchors.right: parent.right
       anchors.bottom: parent.bottom
-      anchors.rightMargin: Style.space(2)
-      anchors.bottomMargin: Style.space(2)
-      color: Color.urgent
+      anchors.margins: Style.space(2)
+      width: Style.space(5); height: width; radius: width / 2
+      color: root.foreground
+      visible: root.pending
+      SequentialAnimation on opacity {
+        running: root.pending && root.animate
+        loops: Animation.Infinite
+        NumberAnimation { to: 0.35; duration: 850 }
+        NumberAnimation { to: 1; duration: 850 }
+      }
     }
-    onPressed: function(buttonCode) { root.toggle() }
   }
 
   KeyboardPanel {
     id: panel
-    anchorItem: button
+    anchorItem: barButton
     owner: root
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(390))
-    contentHeight: panel.fittedContentHeight(content.implicitHeight, Style.space(500))
+    contentWidth: panel.fittedContentWidth(Style.space(400))
+    contentHeight: panel.fittedContentHeight(content.implicitHeight, Style.space(620))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: customDuration.field.activeFocus
-      onActivateRequested: root.refresh()
+      blocked: durationInput.field.activeFocus
       onCloseRequested: root.close()
-
-      Column {
-        id: content
-        width: parent.width
-        spacing: Style.space(12)
-
-        PanelHero {
+      Flickable {
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: content.implicitHeight
+        clip: true
+        Column {
+          id: content
           width: parent.width
-          title: "Passwordless Sudo"
-          meta: root.status.active ? "TEMPORARY ROOT ACCESS" : "OMARCHY SECURITY"
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-          iconComponent: Component {
+          spacing: Style.space(16)
+
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight, heroClock.implicitHeight)
             Text {
-              text: root.status.active ? "󰌾" : "󰌿"
-              color: root.status.active ? Color.urgent : root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.display
+              id: heroIcon
+              text: root.accessOpen ? "󰌿" : "󰌾"
+              color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.display
+              anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
+            }
+            Column {
+              id: heroLabels
+              anchors.left: heroIcon.right; anchors.leftMargin: Style.space(14)
+              anchors.right: heroClock.left; anchors.rightMargin: Style.space(10)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(2)
+              Text {
+                text: "Agent Access"; width: parent.width; elide: Text.ElideRight
+                color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.title; font.bold: true
+              }
+              Text {
+                text: root.accessOpen ? "ACCESS OPEN" : root.pending ? "AWAITING PHONE APPROVAL" : "ACCESS CLOSED"
+                width: parent.width; elide: Text.ElideRight
+                color: root.muted; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+                font.bold: true; font.letterSpacing: 1.2
+              }
+            }
+            Text {
+              id: heroClock
+              text: root.accessOpen ? root.clock(root.remaining) : root.pending ? root.status.requestedMinutes + "m" : ""
+              color: root.foreground; font.family: root.fontFamily; font.pixelSize: Style.font.displayLarge; font.bold: true
+              anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
             }
           }
-        }
 
-        Text {
-          width: parent.width
-          text: root.remainingLabel()
-          color: root.status.active ? Color.urgent : root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          font.bold: true
-          wrapMode: Text.WordWrap
-        }
-
-        Text {
-          width: parent.width
-          text: "Choose a duration. Omarchy will open its normal terminal, show the security warning, and request confirmation before making any change."
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          wrapMode: Text.WordWrap
-        }
-
-        PanelSeparator { width: parent.width; foreground: root.foreground }
-
-        PanelSectionHeader {
-          width: parent.width
-          text: "DURATION"
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-        }
-
-        Grid {
-          id: durationGrid
-          width: parent.width
-          columns: 2
-          spacing: Style.spacing.md
-          readonly property real cellWidth: (width - spacing) / 2
-
-          Repeater {
-            model: root.presets
-
-            Button {
-              required property var modelData
-              width: durationGrid.cellWidth
-              text: String(modelData) + " min"
-              enabled: !root.busy
-              bordered: true
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              fontSize: Style.font.bodySmall
-              verticalPadding: Style.spacing.controlPaddingY
-              onClicked: root.runAction("launch", modelData)
+          Item {
+            visible: root.accessOpen || root.pending
+            width: parent.width; implicitHeight: Style.space(6)
+            Rectangle { id: progressTrack; anchors.fill: parent; radius: height / 2; color: Qt.alpha(root.foreground, 0.12) }
+            Rectangle {
+              anchors.left: parent.left; height: parent.height; radius: height / 2
+              width: parent.width * (root.pending ? 1 : root.progress)
+              color: root.foreground
+              Behavior on width { NumberAnimation { duration: root.animate ? 320 : 0; easing.type: Easing.OutCubic } }
+              SequentialAnimation on opacity {
+                running: root.pending && root.opened && root.animate
+                loops: Animation.Infinite
+                NumberAnimation { to: 0.45; duration: 950; easing.type: Easing.InOutSine }
+                NumberAnimation { to: 1; duration: 950; easing.type: Easing.InOutSine }
+              }
             }
           }
-        }
 
-        NumberField {
-          id: customDuration
-          width: parent.width
-          fieldWidth: width
-          label: "Custom duration in minutes"
-          value: 180
-          from: 1
-          to: 1440
-          stepSize: 15
-          foreground: root.foreground
-          accent: root.accent
-          fontFamily: root.fontFamily
-        }
+          Text {
+            width: parent.width
+            text: !root.configured ? "Scan a QR code once to approve access from your phone."
+              : root.pending || root.accessOpen ? String(root.status.reason || "Maintenance")
+              : "Choose a duration, then approve with your phone."
+            color: root.muted; font.family: root.fontFamily; font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap; textFormat: Text.PlainText
+          }
+          PanelSeparator { width: parent.width; foreground: root.foreground }
+          PanelSectionHeader {
+            visible: root.configured && !root.accessOpen && !root.pending
+            width: parent.width; text: "DURATION"; foreground: root.foreground; fontFamily: root.fontFamily
+          }
 
-        Button {
-          width: parent.width
-          text: "Open for " + customDuration.field.value + " min"
-          enabled: !root.busy && customDuration.field.value >= 1 && customDuration.field.value <= 1440
-          bordered: true
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-          fontSize: Style.font.bodySmall
-          verticalPadding: Style.spacing.controlPaddingY
-          onClicked: root.runAction("launch", customDuration.field.value)
-        }
+          Row {
+            visible: root.configured && !root.accessOpen && !root.pending
+            width: parent.width; spacing: Style.space(8)
+            Repeater {
+              model: [5, 10, 15]
+              Button {
+                required property int modelData
+                width: (content.width - Style.space(16)) / 3
+                text: modelData + " min"
+                bordered: true
+                foreground: root.selectedMinutes === modelData ? root.foreground : root.muted
+                fontFamily: root.fontFamily
+                onClicked: root.selectedMinutes = modelData
+              }
+            }
+          }
 
-        Button {
-          visible: root.status.active
-          width: parent.width
-          text: "Disable now"
-          enabled: !root.busy
-          bordered: true
-          foreground: Color.urgent
-          fontFamily: root.fontFamily
-          fontSize: Style.font.bodySmall
-          verticalPadding: Style.spacing.controlPaddingY
-          onClicked: root.runAction("disable", "")
-        }
+          NumberField {
+            id: durationInput
+            visible: root.configured && !root.pending && ((!root.accessOpen && root.customDuration) || (root.accessOpen && root.shortening))
+            width: parent.width; fieldWidth: width
+            label: root.accessOpen ? "Minutes from now" : "Minutes"
+            from: 1; to: root.accessOpen ? Math.max(1, Math.floor(root.remaining / 60)) : 15
+            value: root.selectedMinutes; stepSize: 1
+            foreground: root.foreground; accent: root.accent; fontFamily: root.fontFamily
+            onModified: function(value) { root.selectedMinutes = value }
+          }
 
-        Text {
-          visible: root.feedback !== ""
-          width: parent.width
-          text: root.feedback
-          color: root.feedbackIsError ? root.urgent : root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          horizontalAlignment: Text.AlignHCenter
+          Button {
+            width: parent.width
+            text: !root.configured ? "Set up phone" : root.accessOpen ? "Close access" : root.pending ? "Enter phone code" : "Request " + root.selectedMinutes + " minutes"
+            enabled: !root.busy
+            bordered: true; foreground: root.foreground; fontFamily: root.fontFamily
+            verticalPadding: Style.spacing.controlPaddingY
+            onClicked: {
+              if (!root.configured) root.run("setup", "")
+              else if (root.accessOpen) root.run("close", "")
+              else if (root.pending) root.run("approve", "")
+              else root.requestAccess()
+            }
+          }
+
+          Button {
+            visible: root.configured && (!root.accessOpen || root.remaining > 60)
+            width: parent.width
+            text: root.pending ? "Cancel request" : root.accessOpen ? (root.shortening ? "Apply shorter window" : "Shorten window") : (root.customDuration ? "Hide custom duration" : "Custom duration")
+            enabled: !root.busy
+            foreground: root.muted; fontFamily: root.fontFamily
+            onClicked: {
+              if (root.pending) root.run("close", "")
+              else if (root.accessOpen && root.shortening) root.run("shorten", root.selectedMinutes)
+              else if (root.accessOpen) { root.selectedMinutes = 1; root.shortening = true }
+              else root.customDuration = !root.customDuration
+            }
+          }
+
+          Text {
+            width: parent.width
+            text: root.pending ? "Remote? Send a fresh phone code to your agent." : root.configured ? "Phone connected · Up to 15 minutes" : "Setup needs your normal administrator password once."
+            color: root.muted; font.family: root.fontFamily; font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+          Button {
+            visible: root.status.rootUpgradeNeeded === true && root.status.ready === true
+            width: parent.width; text: "Update access service"; foreground: root.muted; fontFamily: root.fontFamily
+            onClicked: root.run("setup", "")
+          }
+          Button {
+            visible: root.status.nativeActive === true
+            width: parent.width; text: "Close separate legacy sudo access"; foreground: Commons.Color.urgent; fontFamily: root.fontFamily
+            onClicked: root.run("native-disable", "")
+          }
+          Button {
+            visible: settings && settings.showNativeFlow === true
+            width: parent.width; text: "Legacy Omarchy sudo"; foreground: root.muted; fontFamily: root.fontFamily
+            onClicked: root.run("native-launch", root.selectedMinutes)
+          }
+          Text {
+            visible: root.feedback !== ""
+            width: parent.width; text: root.feedback; textFormat: Text.PlainText
+            color: root.feedbackError ? Commons.Color.urgent : root.muted
+            font.family: root.fontFamily; font.pixelSize: Style.font.caption; wrapMode: Text.WordWrap
+          }
         }
       }
     }

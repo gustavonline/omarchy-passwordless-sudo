@@ -1,52 +1,55 @@
 {
   "schemaVersion": 1,
   "id": "io.github.gustavonline.passwordless-sudo",
-  "name": "Passwordless Sudo",
-  "version": "0.3.0",
+  "name": "Omarchy Agent Access",
+  "version": "0.5.0",
   "author": "Gustav Andersen",
   "license": "MIT",
-  "description": "Open Omarchy's passwordless-sudo flow for a chosen duration from the bar.",
-  "kinds": ["bar-widget"],
+  "description": "Phone-approved access windows for local and remote agents.",
+  "kinds": [
+    "bar-widget"
+  ],
   "activation": "on-demand",
   "entryPoints": {
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Passwordless Sudo",
-    "description": "Launch Omarchy's native, time-limited passwordless-sudo command in its default floating terminal.",
+    "displayName": "Agent Access",
+    "description": "Phone-approved access windows for local and remote agents.",
     "category": "System",
-    "aliases": ["sudo", "passwordless", "agent", "root"],
+    "aliases": [
+      "sudo",
+      "agent",
+      "remote",
+      "approval"
+    ],
     "allowMultiple": false,
-    "defaultSection": "right",
+    "defaultSection": "center",
     "defaults": {
-      "primaryMinutes": 60,
-      "secondaryMinutes": 120,
-      "refreshIntervalSec": 5
+      "animations": true,
+      "showNativeFlow": false,
+      "defaultMinutes": 5
     },
     "schema": [
       {
-        "key": "primaryMinutes",
+        "key": "defaultMinutes",
         "type": "integer",
-        "label": "First preset (minutes)",
+        "label": "Quick access duration (minutes)",
         "min": 1,
-        "max": 1440,
-        "defaultValue": 60
-      },
-      {
-        "key": "secondaryMinutes",
-        "type": "integer",
-        "label": "Second preset (minutes)",
-        "min": 1,
-        "max": 1440,
-        "defaultValue": 120
-      },
-      {
-        "key": "refreshIntervalSec",
-        "type": "integer",
-        "label": "Status refresh (seconds)",
-        "min": 2,
-        "max": 60,
+        "max": 15,
         "defaultValue": 5
+      },
+      {
+        "key": "animations",
+        "type": "boolean",
+        "label": "Animate access status",
+        "defaultValue": true
+      },
+      {
+        "key": "showNativeFlow",
+        "type": "boolean",
+        "label": "Show legacy Omarchy sudo",
+        "defaultValue": false
       }
     ]
   }
